@@ -97,10 +97,11 @@ while True:
     # Count non-zero (white) pixels
     motion_pixels = cv2.countNonZero(motion_mask)
 
-    if motion_pixels > MOTION_PIXEL_THRESHOLD:
-        print(f"Motion detected in frame {idxFrame} (pixels: {motion_pixels})")
-    else:
-        print(f"No significant motion in frame {idxFrame}")
+    # Check if the number of motion pixels exceeds the threshold
+    # if motion_pixels > MOTION_PIXEL_THRESHOLD:
+    #     print(f"Motion detected in frame {idxFrame} (pixels: {motion_pixels})")
+    # else:
+    #     print(f"No significant motion in frame {idxFrame}")
 
     # (Optional) Draw bounding boxes around moving objects
     contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
