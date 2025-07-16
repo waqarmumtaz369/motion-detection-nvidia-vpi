@@ -38,8 +38,13 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
 # Motion detection parameters
-MOTION_PIXEL_THRESHOLD = 500  # Minimum number of motion pixels to trigger detection (tune as needed)
-CONTOUR_AREA_THRESHOLD = 100  # Minimum area for a contour to be considered motion (optional, for bounding boxes)
+MOTION_PIXEL_THRESHOLD = 2000  # Minimum number of motion pixels to trigger detection (tune as needed)
+CONTOUR_AREA_THRESHOLD = 200  # Minimum area for a contour to be considered motion (optional, for bounding boxes)
+
+# Load YOLOv8 model (nano version)
+YOLO_MODEL_PATH = "yolov8n.pt"
+from ultralytics import YOLO
+model = YOLO(YOLO_MODEL_PATH)
 
 
 # ----------------------------
@@ -188,6 +193,8 @@ start_time = time.time()
 idxFrame = 0
 for cvFrame in gstreamer_frame_generator(input_uri):
     idxFrame += 1
+    # Make frame writable for OpenCV drawing
+    cvFrame = cvFrame.copy()
     # Get the foreground mask and background image estimates
     fgmask, bgimage = bgsub(vpi.asimage(cvFrame, vpi.Format.BGR8), learnrate=0.01)
 
@@ -204,19 +211,41 @@ for cvFrame in gstreamer_frame_generator(input_uri):
     # Count non-zero (white) pixels
     motion_pixels = cv2.countNonZero(motion_mask)
 
-    # Check if the number of motion pixels exceeds the threshold
-    # if motion_pixels > MOTION_PIXEL_THRESHOLD:
-    #     print(f"Motion detected in frame {idxFrame} (pixels: {motion_pixels})")
-    # else:
-    #     print(f"No significant motion in frame {idxFrame}")
-
     # (Optional) Draw bounding boxes around moving objects
     contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    motion_rois = []
     for cnt in contours:
         if cv2.contourArea(cnt) > CONTOUR_AREA_THRESHOLD:
             x, y, w, h = cv2.boundingRect(cnt)
-            cv2.rectangle(cvFrame, (x, y), (x+w, y+h), (0,255,0), 2)
+            # cv2.rectangle(cvFrame, (x, y), (x+w, y+h), (0,255,0), 2)
+            motion_rois.append((x, y, w, h))
     # --- END MOTION DETECTION LOGIC ---
+
+    # --- OBJECT DETECTION LOGIC ---
+    # Only run YOLOv8 if motion threshold is exceeded
+    if motion_pixels > MOTION_PIXEL_THRESHOLD and len(motion_rois) > 0:
+        for (x, y, w, h) in motion_rois:
+            roi = cvFrame[y:y+h, x:x+w]
+            if roi.size == 0:
+                continue
+            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            results = model.predict(roi_rgb, imgsz=320, conf=0.25, verbose=False)
+            for r in results:
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    if conf < 0.79:
+                        continue
+                    xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                    bx1, by1, bx2, by2 = xyxy
+                    bx1 += x
+                    bx2 += x
+                    by1 += y
+                    by2 += y
+                    label = model.names[cls_id] if hasattr(model, 'names') else str(cls_id)
+                    cv2.rectangle(cvFrame, (bx1, by1), (bx2, by2), (0,0,255), 2)
+                    cv2.putText(cvFrame, f"{label} {conf:.2f}", (bx1, by1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+    # --- END OBJECT DETECTION LOGIC ---
 
     # Display the processed frame with bounding boxes (cvFrame)
     cv2.imshow('Motion Detection', cvFrame)
