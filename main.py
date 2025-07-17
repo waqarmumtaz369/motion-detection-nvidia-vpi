@@ -67,6 +67,7 @@ model = YOLO(YOLO_MODEL_PATH)
 parser = ArgumentParser()
 parser.add_argument('backend', choices=['cpu','cuda'], help='Backend to be used for processing')
 parser.add_argument('input', help='Input video to be denoised (file path or URI)')
+parser.add_argument('--display', action='store_true', help='Enable video display (default: False)')
 args = parser.parse_args()
 
 if args.backend == 'cuda':
@@ -250,15 +251,31 @@ def to_gst_uri(path):
     return pathlib.Path(path).absolute().as_uri()
 
 
+class DisplayWrapper:
+    """Wrapper class to handle display logic based on display flag"""
+    def __init__(self, width, height, fps=30, enable_display=False):
+        self.display_enabled = enable_display
+        self.gst_display = None
+        if self.display_enabled:
+            self.gst_display = GstDisplay(width, height, fps)
+            atexit.register(self.close)
+    
+    def push(self, frame):
+        if self.display_enabled and self.gst_display:
+            self.gst_display.push(frame)
+    
+    def close(self):
+        if self.display_enabled and self.gst_display:
+            self.gst_display.close()
+
 input_uri = to_gst_uri(args.input)
 inSize = get_video_size(input_uri)
 if inSize == (0, 0):
     print(f"Error: Could not open input video file '{args.input}' via GStreamer")
     sys.exit(1)
 
-# --- Initialize GStreamer display pipeline ---
-gst_display = GstDisplay(inSize[0], inSize[1], fps=30)
-atexit.register(gst_display.close)
+# --- Initialize display handler ---
+display = DisplayWrapper(inSize[0], inSize[1], fps=30, enable_display=args.display)
 
 #--------------------------------------------------------------
 # Create the Background Subtractor object using the backend specified by the user
@@ -326,19 +343,18 @@ for cvFrame in gstreamer_frame_generator(input_uri):
     # --- END OBJECT DETECTION LOGIC ---
 
 
-    # Display the processed frame using GStreamer display pipeline
-    gst_display.push(cvFrame)
-    # Optionally, display the mask as well using OpenCV (for debug):
-    # cv2.imshow('Foreground Mask', motion_mask)
-    # To support early exit, check for keyboard input (optional, only if running in a windowed environment)
-    # If you want to support 'q' to quit, you can keep cv2.waitKey, but it won't close the GStreamer window
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    # Display the processed frame if display is enabled
+    display.push(cvFrame)
+    
+    # Handle keyboard input if display is enabled
+    if args.display and cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 
 end_time = time.time()
-cv2.destroyAllWindows()
-gst_display.close()
+if args.display:
+    cv2.destroyAllWindows()
+display.close()
 total_time = end_time - start_time
 print("Total time taken to process the video: {:.2f} seconds".format(total_time))
 print("Total number of frames processed: {}".format(idxFrame))
