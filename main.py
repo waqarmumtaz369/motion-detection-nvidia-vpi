@@ -85,25 +85,32 @@ Gst.init(None)
 gst_init_end = time.time()
 print(f"[{datetime.datetime.now().isoformat()}] GStreamer initialized. Took {gst_init_end-gst_init_start:.3f} seconds.")
 
-def build_nvidia_gst_pipeline(uri):
+
+def build_nvidia_gst_pipeline(uri, target_w=None, target_h=None):
     """
     Build a GStreamer pipeline string using NVIDIA hardware decoder if possible.
-    Only supports local files (mp4, mkv, mov, avi) with H.264/H.265 for now.
-    Falls back to software decoding if nvv4l2decoder is not available.
+    Adds videoscale and capsfilter to resize frames if needed, preserving aspect ratio.
+    
+    Args:
+        uri: Input URI or file path
+        target_w: Target width (if None, no resize)
+        target_h: Target height (if None, no resize)
     """
     import os
     from urllib.parse import urlparse
-    # Prefer nvh264dec (x86_64 RTX) over nvv4l2decoder (Jetson/embedded)
     nvh264_available = Gst.ElementFactory.find("nvh264dec") is not None
     nvv4l2_available = Gst.ElementFactory.find("nvv4l2decoder") is not None
-    # Determine if local file or URI
     parsed = urlparse(uri)
+    
+    # Build caps string with or without resize
+    if target_w and target_h:
+        resize_caps = f"videoscale ! video/x-raw,format=RGB,width={target_w},height={target_h} !"
+    else:
+        resize_caps = "videoconvert ! video/x-raw,format=RGB !"
     if parsed.scheme in ("file", ""):
-        # Local file
         path = parsed.path if parsed.scheme else uri
         ext = os.path.splitext(path)[1].lower()
         if ext in [".mp4", ".mov", ".mkv", ".avi"]:
-            # Use qtdemux for mp4/mov, matroskademux for mkv, avidemux for avi
             if ext in [".mp4", ".mov"]:
                 demux = "qtdemux"
             elif ext == ".mkv":
@@ -116,34 +123,83 @@ def build_nvidia_gst_pipeline(uri):
                 print("[INFO] Using NVIDIA nvh264dec for hardware-accelerated decoding (x86_64, RTX).")
                 pipeline = (
                     f"filesrc location=\"{path}\" ! {demux} ! h264parse ! nvh264dec ! "
-                    "videoconvert ! video/x-raw,format=BGR ! appsink name=sink"
+                    f"videoconvert ! {resize_caps} appsink name=sink"
                 )
             elif nvv4l2_available:
                 print("[INFO] Using NVIDIA nvv4l2decoder for hardware-accelerated decoding (Jetson/embedded).")
                 pipeline = (
                     f"filesrc location=\"{path}\" ! {demux} ! h264parse ! nvv4l2decoder ! "
-                    "videoconvert ! video/x-raw,format=BGR ! appsink name=sink"
+                    f"videoconvert ! {resize_caps} appsink name=sink"
                 )
             else:
                 print("[WARNING] No NVIDIA hardware decoder found. Falling back to software decoding (avdec_h264). To enable hardware acceleration, install NVIDIA GStreamer plugins.")
                 pipeline = (
                     f"filesrc location=\"{path}\" ! {demux} ! h264parse ! avdec_h264 ! "
-                    "videoconvert ! video/x-raw,format=BGR ! appsink name=sink"
+                    f"videoconvert ! {resize_caps} appsink name=sink"
                 )
             return pipeline
         else:
-            # Fallback to uridecodebin for other formats
-            return f"uridecodebin uri={uri} ! videoconvert ! video/x-raw,format=BGR ! appsink name=sink"
+            return f"uridecodebin uri={uri} ! videoconvert ! {resize_caps} appsink name=sink"
     else:
-        # For network streams, fallback to uridecodebin
-        return f"uridecodebin uri={uri} ! videoconvert ! video/x-raw,format=BGR ! appsink name=sink"
+        return f"uridecodebin uri={uri} ! videoconvert ! {resize_caps} appsink name=sink"
+
+def gstreamer_frame_generator_raw(uri):
+    """
+    Base GStreamer pipeline that returns frames at original size.
+    """
+    import datetime
+    # Create a pipeline without resizing to get original frame size
+    pipeline_str = build_nvidia_gst_pipeline(uri)
+    pipeline = Gst.parse_launch(pipeline_str)
+    appsink = pipeline.get_by_name('sink')
+    appsink.set_property('emit-signals', True)
+    appsink.set_property('sync', False)
+    pipeline.set_state(Gst.State.PLAYING)
+    try:
+        sample = appsink.emit('try-pull-sample', Gst.SECOND)
+        if sample:
+            buf = sample.get_buffer()
+            caps = sample.get_caps()
+            structure = caps.get_structure(0)
+            width = structure.get_value('width')
+            height = structure.get_value('height')
+            success, mapinfo = buf.map(Gst.MapFlags.READ)
+            if success:
+                try:
+                    data = mapinfo.data
+                    arr = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+                    yield arr
+                finally:
+                    buf.unmap(mapinfo)
+    finally:
+        pipeline.set_state(Gst.State.NULL)
 
 def gstreamer_frame_generator(uri):
     """
     GStreamer pipeline to read frames and yield them as numpy arrays (BGR), using NVIDIA decoder if possible.
+    Automatically resizes if width > 640 while preserving aspect ratio.
     """
+    # First get the original size to calculate aspect ratio if needed
+    orig_size = None
+    for frame in gstreamer_frame_generator_raw(uri):
+        orig_size = (frame.shape[1], frame.shape[0])  # width, height
+        break
+    if not orig_size:
+        raise RuntimeError("Could not get original frame size")
+    
+    # Calculate target size maintaining aspect ratio
+    orig_w, orig_h = orig_size
+    if orig_w > 640:
+        target_w = 640
+        target_h = int(orig_h * (640 / orig_w))
+        print(f"[INFO] Resizing from {orig_w}x{orig_h} to {target_w}x{target_h} to maintain aspect ratio")
+    else:
+        target_w, target_h = orig_w, orig_h
+        print(f"[INFO] No resizing needed, original size {orig_w}x{orig_h} (width <= 640)")
+    
+    # Now create the pipeline with the correct size
     import datetime
-    pipeline_str = build_nvidia_gst_pipeline(uri)
+    pipeline_str = build_nvidia_gst_pipeline(uri, target_w, target_h)
     pipeline_start = time.time()
     print(f"[{datetime.datetime.now().isoformat()}] Starting GStreamer pipeline creation and set_state...")
     pipeline = Gst.parse_launch(pipeline_str)
@@ -172,6 +228,8 @@ def gstreamer_frame_generator(uri):
             try:
                 data = mapinfo.data
                 arr = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+                # Convert RGB (from GStreamer) to BGR (for OpenCV compatibility)
+                arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
             finally:
                 buf.unmap(mapinfo)
             yield arr
