@@ -38,10 +38,11 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
 # Motion detection parameters
-MOTION_PIXEL_THRESHOLD = 2000  # Minimum number of motion pixels to trigger detection (tune as needed)
-CONTOUR_AREA_THRESHOLD = 200  # Minimum area for a contour to be considered motion (optional, for bounding boxes)
+MOTION_PIXEL_THRESHOLD = 1000  # Minimum number of motion pixels to trigger detection (tune as needed)
+CONTOUR_AREA_THRESHOLD = 100  # Minimum area for a contour to be considered motion (optional, for bounding boxes)
 
 # Load YOLOv8 model (nano version)
+# YOLO_MODEL_PATH = "yolov8s.pt"
 YOLO_MODEL_PATH = "yolov8n.pt"
 from ultralytics import YOLO
 model = YOLO(YOLO_MODEL_PATH)
@@ -224,27 +225,26 @@ for cvFrame in gstreamer_frame_generator(input_uri):
     # --- OBJECT DETECTION LOGIC ---
     # Only run YOLOv8 if motion threshold is exceeded
     if motion_pixels > MOTION_PIXEL_THRESHOLD and len(motion_rois) > 0:
-        for (x, y, w, h) in motion_rois:
-            roi = cvFrame[y:y+h, x:x+w]
-            if roi.size == 0:
-                continue
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-            results = model.predict(roi_rgb, imgsz=320, conf=0.25, verbose=False)
-            for r in results:
-                for box in r.boxes:
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    if conf < 0.79:
-                        continue
-                    xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                    bx1, by1, bx2, by2 = xyxy
-                    bx1 += x
-                    bx2 += x
-                    by1 += y
-                    by2 += y
-                    label = model.names[cls_id] if hasattr(model, 'names') else str(cls_id)
-                    cv2.rectangle(cvFrame, (bx1, by1), (bx2, by2), (0,0,255), 2)
-                    cv2.putText(cvFrame, f"{label} {conf:.2f}", (bx1, by1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+        # Run YOLO once on the whole frame (RGB)
+        frame_rgb = cv2.cvtColor(cvFrame, cv2.COLOR_BGR2RGB)
+        results = model.predict(frame_rgb, imgsz=320, conf=0.25, verbose=False)
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                if conf < 0.79:
+                    continue
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                bx1, by1, bx2, by2 = xyxy
+                # Check if the center of the detection is inside any motion ROI
+                cx = int((bx1 + bx2) / 2)
+                cy = int((by1 + by2) / 2)
+                for (mx, my, mw, mh) in motion_rois:
+                    if mx <= cx <= mx+mw and my <= cy <= my+mh:
+                        label = model.names[cls_id] if hasattr(model, 'names') else str(cls_id)
+                        cv2.rectangle(cvFrame, (bx1, by1), (bx2, by2), (0,0,255), 2)
+                        cv2.putText(cvFrame, f"{label} {conf:.2f}", (bx1, by1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+                        break
     # --- END OBJECT DETECTION LOGIC ---
 
     # Display the processed frame with bounding boxes (cvFrame)
