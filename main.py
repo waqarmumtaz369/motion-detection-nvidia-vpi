@@ -2,8 +2,49 @@ import sys
 import vpi
 import numpy as np
 from argparse import ArgumentParser
+
 import cv2
 import time
+
+# --- GStreamer display pipeline helper ---
+class GstDisplay:
+    def __init__(self, width, height, fps=30):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.pipeline = None
+        self.appsrc = None
+        self._init_pipeline()
+
+    def _init_pipeline(self):
+        # Use autovideosink for portability, nveglglessink for Jetson
+        pipeline_str = (
+            f"appsrc name=src is-live=true block=true format=3 caps=video/x-raw,format=BGR,width={self.width},height={self.height},framerate={self.fps}/1 "
+            f"! videoconvert ! autovideosink sync=false"
+        )
+        self.pipeline = Gst.parse_launch(pipeline_str)
+        self.appsrc = self.pipeline.get_by_name('src')
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+    def push(self, frame):
+        # frame: numpy array (BGR, uint8)
+        import ctypes
+        data = frame.tobytes()
+        buf = Gst.Buffer.new_allocate(None, len(data), None)
+        buf.fill(0, data)
+        # Set timestamp and duration for smooth playback
+        duration = int(1e9 / self.fps)
+        buf.pts = buf.dts = int(time.time() * 1e9)
+        buf.duration = duration
+        retval = self.appsrc.emit('push-buffer', buf)
+        if retval != Gst.FlowReturn.OK:
+            print(f"[WARNING] GStreamer push-buffer returned {retval}")
+
+    def close(self):
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+
+import atexit
 
 # GStreamer imports
 import gi
@@ -150,11 +191,16 @@ def to_gst_uri(path):
     import pathlib
     return pathlib.Path(path).absolute().as_uri()
 
+
 input_uri = to_gst_uri(args.input)
 inSize = get_video_size(input_uri)
 if inSize == (0, 0):
     print(f"Error: Could not open input video file '{args.input}' via GStreamer")
     sys.exit(1)
+
+# --- Initialize GStreamer display pipeline ---
+gst_display = GstDisplay(inSize[0], inSize[1], fps=30)
+atexit.register(gst_display.close)
 
 #--------------------------------------------------------------
 # Create the Background Subtractor object using the backend specified by the user
@@ -221,16 +267,20 @@ for cvFrame in gstreamer_frame_generator(input_uri):
                         break
     # --- END OBJECT DETECTION LOGIC ---
 
-    # Display the processed frame with bounding boxes (cvFrame)
-    cv2.imshow('Motion Detection', cvFrame)
-    # Optionally, display the mask as well:
+
+    # Display the processed frame using GStreamer display pipeline
+    gst_display.push(cvFrame)
+    # Optionally, display the mask as well using OpenCV (for debug):
     # cv2.imshow('Foreground Mask', motion_mask)
-    # Press 'q' to exit early
+    # To support early exit, check for keyboard input (optional, only if running in a windowed environment)
+    # If you want to support 'q' to quit, you can keep cv2.waitKey, but it won't close the GStreamer window
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
+
 end_time = time.time()
 cv2.destroyAllWindows()
+gst_display.close()
 total_time = end_time - start_time
 print("Total time taken to process the video: {:.2f} seconds".format(total_time))
 print("Total number of frames processed: {}".format(idxFrame))
