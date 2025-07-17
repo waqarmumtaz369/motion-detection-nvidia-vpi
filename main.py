@@ -38,7 +38,7 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
 # Motion detection parameters
-MOTION_PIXEL_THRESHOLD = 1000  # Minimum number of motion pixels to trigger detection (tune as needed)
+# MOTION_PIXEL_THRESHOLD = 1000  # Minimum number of motion pixels to trigger detection (tune as needed)
 CONTOUR_AREA_THRESHOLD = 100  # Minimum area for a contour to be considered motion (optional, for bounding boxes)
 
 # Load YOLOv8 model (nano version)
@@ -210,7 +210,7 @@ for cvFrame in gstreamer_frame_generator(input_uri):
     _, motion_mask = cv2.threshold(fgmask_gray, 127, 255, cv2.THRESH_BINARY)
 
     # Count non-zero (white) pixels
-    motion_pixels = cv2.countNonZero(motion_mask)
+    # motion_pixels = cv2.countNonZero(motion_mask)
 
     # (Optional) Draw bounding boxes around moving objects
     contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -224,7 +224,8 @@ for cvFrame in gstreamer_frame_generator(input_uri):
 
     # --- OBJECT DETECTION LOGIC ---
     # Only run YOLOv8 if motion threshold is exceeded
-    if motion_pixels > MOTION_PIXEL_THRESHOLD and len(motion_rois) > 0:
+    # if motion_pixels > MOTION_PIXEL_THRESHOLD and len(motion_rois) > 0:
+    if len(motion_rois) > 0:
         # Run YOLO once on the whole frame (RGB)
         frame_rgb = cv2.cvtColor(cvFrame, cv2.COLOR_BGR2RGB)
         results = model.predict(frame_rgb, imgsz=320, conf=0.25, verbose=False)
@@ -232,7 +233,7 @@ for cvFrame in gstreamer_frame_generator(input_uri):
             for box in r.boxes:
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
-                if conf < 0.79:
+                if conf < 0.70:
                     continue
                 xyxy = box.xyxy[0].cpu().numpy().astype(int)
                 bx1, by1, bx2, by2 = xyxy
