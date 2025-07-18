@@ -1,36 +1,50 @@
-# Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions
-# are met:
-#  * Redistributions of source code must retain the above copyright
-#    notice, this list of conditions and the following disclaimer.
-#  * Redistributions in binary form must reproduce the above copyright
-#    notice, this list of conditions and the following disclaimer in the
-#    documentation and/or other materials provided with the distribution.
-#  * Neither the name of NVIDIA CORPORATION nor the names of its
-#    contributors may be used to endorse or promote products derived
-#    from this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
-# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-# OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-
 import sys
 import vpi
 import numpy as np
 from argparse import ArgumentParser
+
 import cv2
 import time
+
+# --- GStreamer display pipeline helper ---
+class GstDisplay:
+    def __init__(self, width, height, fps=30):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.pipeline = None
+        self.appsrc = None
+        self._init_pipeline()
+
+    def _init_pipeline(self):
+        # Use autovideosink for portability, nveglglessink for Jetson
+        pipeline_str = (
+            f"appsrc name=src is-live=true block=true format=3 caps=video/x-raw,format=BGR,width={self.width},height={self.height},framerate={self.fps}/1 "
+            f"! videoconvert ! autovideosink sync=false"
+        )
+        self.pipeline = Gst.parse_launch(pipeline_str)
+        self.appsrc = self.pipeline.get_by_name('src')
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+    def push(self, frame):
+        # frame: numpy array (BGR, uint8)
+        import ctypes
+        data = frame.tobytes()
+        buf = Gst.Buffer.new_allocate(None, len(data), None)
+        buf.fill(0, data)
+        # Set timestamp and duration for smooth playback
+        duration = int(1e9 / self.fps)
+        buf.pts = buf.dts = int(time.time() * 1e9)
+        buf.duration = duration
+        retval = self.appsrc.emit('push-buffer', buf)
+        if retval != Gst.FlowReturn.OK:
+            print(f"[WARNING] GStreamer push-buffer returned {retval}")
+
+    def close(self):
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+
+import atexit
 
 # GStreamer imports
 import gi
@@ -38,8 +52,14 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
 # Motion detection parameters
-MOTION_PIXEL_THRESHOLD = 500  # Minimum number of motion pixels to trigger detection (tune as needed)
+# MOTION_PIXEL_THRESHOLD = 1000  # Minimum number of motion pixels to trigger detection (tune as needed)
 CONTOUR_AREA_THRESHOLD = 100  # Minimum area for a contour to be considered motion (optional, for bounding boxes)
+
+# Load YOLOv8 model 
+YOLO_MODEL_PATH = "yolov8s.pt"
+
+from ultralytics import YOLO
+model = YOLO(YOLO_MODEL_PATH)
 
 
 # ----------------------------
@@ -47,6 +67,7 @@ CONTOUR_AREA_THRESHOLD = 100  # Minimum area for a contour to be considered moti
 parser = ArgumentParser()
 parser.add_argument('backend', choices=['cpu','cuda'], help='Backend to be used for processing')
 parser.add_argument('input', help='Input video to be denoised (file path or URI)')
+parser.add_argument('--display', action='store_true', help='Enable video display (default: False)')
 args = parser.parse_args()
 
 if args.backend == 'cuda':
@@ -65,25 +86,32 @@ Gst.init(None)
 gst_init_end = time.time()
 print(f"[{datetime.datetime.now().isoformat()}] GStreamer initialized. Took {gst_init_end-gst_init_start:.3f} seconds.")
 
-def build_nvidia_gst_pipeline(uri):
+
+def build_nvidia_gst_pipeline(uri, target_w=None, target_h=None):
     """
     Build a GStreamer pipeline string using NVIDIA hardware decoder if possible.
-    Only supports local files (mp4, mkv, mov, avi) with H.264/H.265 for now.
-    Falls back to software decoding if nvv4l2decoder is not available.
+    Adds videoscale and capsfilter to resize frames if needed, preserving aspect ratio.
+    
+    Args:
+        uri: Input URI or file path
+        target_w: Target width (if None, no resize)
+        target_h: Target height (if None, no resize)
     """
     import os
     from urllib.parse import urlparse
-    # Prefer nvh264dec (x86_64 RTX) over nvv4l2decoder (Jetson/embedded)
     nvh264_available = Gst.ElementFactory.find("nvh264dec") is not None
     nvv4l2_available = Gst.ElementFactory.find("nvv4l2decoder") is not None
-    # Determine if local file or URI
     parsed = urlparse(uri)
+    
+    # Build caps string with or without resize
+    if target_w and target_h:
+        resize_caps = f"videoscale ! video/x-raw,format=RGB,width={target_w},height={target_h} !"
+    else:
+        resize_caps = "videoconvert ! video/x-raw,format=RGB !"
     if parsed.scheme in ("file", ""):
-        # Local file
         path = parsed.path if parsed.scheme else uri
         ext = os.path.splitext(path)[1].lower()
         if ext in [".mp4", ".mov", ".mkv", ".avi"]:
-            # Use qtdemux for mp4/mov, matroskademux for mkv, avidemux for avi
             if ext in [".mp4", ".mov"]:
                 demux = "qtdemux"
             elif ext == ".mkv":
@@ -96,34 +124,83 @@ def build_nvidia_gst_pipeline(uri):
                 print("[INFO] Using NVIDIA nvh264dec for hardware-accelerated decoding (x86_64, RTX).")
                 pipeline = (
                     f"filesrc location=\"{path}\" ! {demux} ! h264parse ! nvh264dec ! "
-                    "videoconvert ! video/x-raw,format=BGR ! appsink name=sink"
+                    f"videoconvert ! {resize_caps} appsink name=sink"
                 )
             elif nvv4l2_available:
                 print("[INFO] Using NVIDIA nvv4l2decoder for hardware-accelerated decoding (Jetson/embedded).")
                 pipeline = (
                     f"filesrc location=\"{path}\" ! {demux} ! h264parse ! nvv4l2decoder ! "
-                    "videoconvert ! video/x-raw,format=BGR ! appsink name=sink"
+                    f"videoconvert ! {resize_caps} appsink name=sink"
                 )
             else:
                 print("[WARNING] No NVIDIA hardware decoder found. Falling back to software decoding (avdec_h264). To enable hardware acceleration, install NVIDIA GStreamer plugins.")
                 pipeline = (
                     f"filesrc location=\"{path}\" ! {demux} ! h264parse ! avdec_h264 ! "
-                    "videoconvert ! video/x-raw,format=BGR ! appsink name=sink"
+                    f"videoconvert ! {resize_caps} appsink name=sink"
                 )
             return pipeline
         else:
-            # Fallback to uridecodebin for other formats
-            return f"uridecodebin uri={uri} ! videoconvert ! video/x-raw,format=BGR ! appsink name=sink"
+            return f"uridecodebin uri={uri} ! videoconvert ! {resize_caps} appsink name=sink"
     else:
-        # For network streams, fallback to uridecodebin
-        return f"uridecodebin uri={uri} ! videoconvert ! video/x-raw,format=BGR ! appsink name=sink"
+        return f"uridecodebin uri={uri} ! videoconvert ! {resize_caps} appsink name=sink"
+
+def gstreamer_frame_generator_raw(uri):
+    """
+    Base GStreamer pipeline that returns frames at original size.
+    """
+    import datetime
+    # Create a pipeline without resizing to get original frame size
+    pipeline_str = build_nvidia_gst_pipeline(uri)
+    pipeline = Gst.parse_launch(pipeline_str)
+    appsink = pipeline.get_by_name('sink')
+    appsink.set_property('emit-signals', True)
+    appsink.set_property('sync', False)
+    pipeline.set_state(Gst.State.PLAYING)
+    try:
+        sample = appsink.emit('try-pull-sample', Gst.SECOND)
+        if sample:
+            buf = sample.get_buffer()
+            caps = sample.get_caps()
+            structure = caps.get_structure(0)
+            width = structure.get_value('width')
+            height = structure.get_value('height')
+            success, mapinfo = buf.map(Gst.MapFlags.READ)
+            if success:
+                try:
+                    data = mapinfo.data
+                    arr = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+                    yield arr
+                finally:
+                    buf.unmap(mapinfo)
+    finally:
+        pipeline.set_state(Gst.State.NULL)
 
 def gstreamer_frame_generator(uri):
     """
     GStreamer pipeline to read frames and yield them as numpy arrays (BGR), using NVIDIA decoder if possible.
+    Automatically resizes if width > 640 while preserving aspect ratio.
     """
+    # First get the original size to calculate aspect ratio if needed
+    orig_size = None
+    for frame in gstreamer_frame_generator_raw(uri):
+        orig_size = (frame.shape[1], frame.shape[0])  # width, height
+        break
+    if not orig_size:
+        raise RuntimeError("Could not get original frame size")
+    
+    # Calculate target size maintaining aspect ratio
+    orig_w, orig_h = orig_size
+    if orig_w > 640:
+        target_w = 640
+        target_h = int(orig_h * (640 / orig_w))
+        print(f"[INFO] Resizing from {orig_w}x{orig_h} to {target_w}x{target_h} to maintain aspect ratio")
+    else:
+        target_w, target_h = orig_w, orig_h
+        print(f"[INFO] No resizing needed, original size {orig_w}x{orig_h} (width <= 640)")
+    
+    # Now create the pipeline with the correct size
     import datetime
-    pipeline_str = build_nvidia_gst_pipeline(uri)
+    pipeline_str = build_nvidia_gst_pipeline(uri, target_w, target_h)
     pipeline_start = time.time()
     print(f"[{datetime.datetime.now().isoformat()}] Starting GStreamer pipeline creation and set_state...")
     pipeline = Gst.parse_launch(pipeline_str)
@@ -152,6 +229,8 @@ def gstreamer_frame_generator(uri):
             try:
                 data = mapinfo.data
                 arr = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+                # Convert RGB (from GStreamer) to BGR (for OpenCV compatibility)
+                arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
             finally:
                 buf.unmap(mapinfo)
             yield arr
@@ -171,11 +250,32 @@ def to_gst_uri(path):
     import pathlib
     return pathlib.Path(path).absolute().as_uri()
 
+
+class DisplayWrapper:
+    """Wrapper class to handle display logic based on display flag"""
+    def __init__(self, width, height, fps=30, enable_display=False):
+        self.display_enabled = enable_display
+        self.gst_display = None
+        if self.display_enabled:
+            self.gst_display = GstDisplay(width, height, fps)
+            atexit.register(self.close)
+    
+    def push(self, frame):
+        if self.display_enabled and self.gst_display:
+            self.gst_display.push(frame)
+    
+    def close(self):
+        if self.display_enabled and self.gst_display:
+            self.gst_display.close()
+
 input_uri = to_gst_uri(args.input)
 inSize = get_video_size(input_uri)
 if inSize == (0, 0):
     print(f"Error: Could not open input video file '{args.input}' via GStreamer")
     sys.exit(1)
+
+# --- Initialize display handler ---
+display = DisplayWrapper(inSize[0], inSize[1], fps=30, enable_display=args.display)
 
 #--------------------------------------------------------------
 # Create the Background Subtractor object using the backend specified by the user
@@ -188,6 +288,8 @@ start_time = time.time()
 idxFrame = 0
 for cvFrame in gstreamer_frame_generator(input_uri):
     idxFrame += 1
+    # Make frame writable for OpenCV drawing
+    cvFrame = cvFrame.copy()
     # Get the foreground mask and background image estimates
     fgmask, bgimage = bgsub(vpi.asimage(cvFrame, vpi.Format.BGR8), learnrate=0.01)
 
@@ -202,32 +304,57 @@ for cvFrame in gstreamer_frame_generator(input_uri):
     _, motion_mask = cv2.threshold(fgmask_gray, 127, 255, cv2.THRESH_BINARY)
 
     # Count non-zero (white) pixels
-    motion_pixels = cv2.countNonZero(motion_mask)
-
-    # Check if the number of motion pixels exceeds the threshold
-    # if motion_pixels > MOTION_PIXEL_THRESHOLD:
-    #     print(f"Motion detected in frame {idxFrame} (pixels: {motion_pixels})")
-    # else:
-    #     print(f"No significant motion in frame {idxFrame}")
+    # motion_pixels = cv2.countNonZero(motion_mask)
 
     # (Optional) Draw bounding boxes around moving objects
     contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    motion_rois = []
     for cnt in contours:
         if cv2.contourArea(cnt) > CONTOUR_AREA_THRESHOLD:
             x, y, w, h = cv2.boundingRect(cnt)
-            cv2.rectangle(cvFrame, (x, y), (x+w, y+h), (0,255,0), 2)
+            # cv2.rectangle(cvFrame, (x, y), (x+w, y+h), (0,255,0), 2)
+            motion_rois.append((x, y, w, h))
     # --- END MOTION DETECTION LOGIC ---
 
-    # Display the processed frame with bounding boxes (cvFrame)
-    cv2.imshow('Motion Detection', cvFrame)
-    # Optionally, display the mask as well:
-    # cv2.imshow('Foreground Mask', motion_mask)
-    # Press 'q' to exit early
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    # --- OBJECT DETECTION LOGIC ---
+    # Only run YOLOv8 if motion threshold is exceeded
+    # if motion_pixels > MOTION_PIXEL_THRESHOLD and len(motion_rois) > 0:
+    if len(motion_rois) > 0:
+        # Run YOLO once on the whole frame (RGB)
+        frame_rgb = cv2.cvtColor(cvFrame, cv2.COLOR_BGR2RGB)
+        results = model.predict(frame_rgb, imgsz=320, conf=0.25, verbose=False)
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                if conf < 0.70:
+                    continue
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                bx1, by1, bx2, by2 = xyxy
+                # Check if the center of the detection is inside any motion ROI
+                cx = int((bx1 + bx2) / 2)
+                cy = int((by1 + by2) / 2)
+                for (mx, my, mw, mh) in motion_rois:
+                    if mx <= cx <= mx+mw and my <= cy <= my+mh:
+                        label = model.names[cls_id] if hasattr(model, 'names') else str(cls_id)
+                        cv2.rectangle(cvFrame, (bx1, by1), (bx2, by2), (0,0,255), 2)
+                        cv2.putText(cvFrame, f"{label} {conf:.2f}", (bx1, by1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+                        break
+    # --- END OBJECT DETECTION LOGIC ---
+
+
+    # Display the processed frame if display is enabled
+    display.push(cvFrame)
+    
+    # Handle keyboard input if display is enabled
+    if args.display and cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
+
 end_time = time.time()
-cv2.destroyAllWindows()
+if args.display:
+    cv2.destroyAllWindows()
+display.close()
 total_time = end_time - start_time
 print("Total time taken to process the video: {:.2f} seconds".format(total_time))
 print("Total number of frames processed: {}".format(idxFrame))
