@@ -5,6 +5,9 @@ from argparse import ArgumentParser
 
 import cv2
 import time
+import threading
+from rabbitmq_client import RabbitMQClient
+import json
 
 # --- GStreamer display pipeline helper ---
 class GstDisplay:
@@ -286,6 +289,20 @@ with backend:
 # Main processing loop using GStreamer
 start_time = time.time()
 idxFrame = 0
+# Initialize RabbitMQ client (before main loop)
+rabbit_client = None
+try:
+    rabbit_client = RabbitMQClient()
+    # Test the connection
+    if rabbit_client.connect():
+        print("[INFO] RabbitMQ client initialized and connected successfully")
+    else:
+        print("[ERROR] RabbitMQ client failed to connect")
+        rabbit_client = None
+except Exception as e:
+    print(f"[ERROR] Could not initialize RabbitMQ client: {e}")
+    rabbit_client = None
+
 for cvFrame in gstreamer_frame_generator(input_uri):
     idxFrame += 1
     # Make frame writable for OpenCV drawing
@@ -323,6 +340,9 @@ for cvFrame in gstreamer_frame_generator(input_uri):
         # Run YOLO once on the whole frame (RGB)
         frame_rgb = cv2.cvtColor(cvFrame, cv2.COLOR_BGR2RGB)
         results = model.predict(frame_rgb, imgsz=320, conf=0.25, verbose=False)
+        detection_results = []  # To collect detection info for this frame
+        object_names = []
+        bb_coords = []
         for r in results:
             for box in r.boxes:
                 cls_id = int(box.cls[0])
@@ -339,7 +359,39 @@ for cvFrame in gstreamer_frame_generator(input_uri):
                         label = model.names[cls_id] if hasattr(model, 'names') else str(cls_id)
                         cv2.rectangle(cvFrame, (bx1, by1), (bx2, by2), (0,0,255), 2)
                         cv2.putText(cvFrame, f"{label} {conf:.2f}", (bx1, by1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+                        # Collect detection info
+                        object_names.append(label)
+                        bb_coords.append([int(bx1), int(by1), int(bx2), int(by2)])
                         break
+    # After all detections for this frame, build the JSON object
+    detection_json = {
+        "camera_number": 1,  # Default, or parse from input if needed
+        "frame_number": idxFrame,
+        "alert_type": "motion_detection",
+        "no_of_objects": len(object_names),
+        "list_of_object_names": object_names,
+        "bb_coord_of_objects": bb_coords
+    }
+    # Append detection_json to results.json (newline-delimited JSON)
+    with open("results.json", "a") as f:
+        f.write(json.dumps(detection_json) + "\n")
+    # Send to RabbitMQ in a separate thread (non-blocking)
+    def send_to_rabbitmq(data):
+        if rabbit_client:
+            try:
+                success = rabbit_client.publish_frame_details(data)
+                if success:
+                    print(f"[INFO] Frame {idxFrame} data sent to RabbitMQ successfully")
+                else:
+                    print(f"[WARNING] Failed to send frame {idxFrame} data to RabbitMQ")
+            except Exception as e:
+                print(f"[ERROR] Exception while sending frame {idxFrame} to RabbitMQ: {e}")
+        else:
+            print(f"[WARNING] RabbitMQ client not available, skipping frame {idxFrame}")
+    
+    # Only send to RabbitMQ if there are detected objects
+    if len(object_names) > 0:
+        threading.Thread(target=send_to_rabbitmq, args=(detection_json,), daemon=True).start()
     # --- END OBJECT DETECTION LOGIC ---
 
 
@@ -355,6 +407,12 @@ end_time = time.time()
 if args.display:
     cv2.destroyAllWindows()
 display.close()
+
+# Close RabbitMQ connection
+if rabbit_client:
+    rabbit_client.close()
+    print("[INFO] RabbitMQ connection closed")
+
 total_time = end_time - start_time
 print("Total time taken to process the video: {:.2f} seconds".format(total_time))
 print("Total number of frames processed: {}".format(idxFrame))
